@@ -1,0 +1,51 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 打包输出
+build/
+dist/
+*.spec
+
+# 日志和临时文件
+*.log
+*.tmp
+*.bak
+*.old
+
+# 本地配置/敏感配置
+.env
+.env.*
+config.json
+settings.json
+secrets.json
+credentials.json
+token.json
+cookies.json
+
+# 数据库/本地数据
+*.db
+*.sqlite
+*.sqlite3
+
+# Excel / PDF 业务数据
+*.xlsx
+*.xls
+*.csv
+*.pdf
+
+# 你的报货配置，如果里面有供应商/业务规则，不想公开就忽略
+baohuo_rules.json
+
+# Windows / macOS
+Thumbs.db
+.DS_Store
+
+# VS Code 本地设置
+.vscode/

@@ -1,0 +1,157 @@
+{
+  "version": 3,
+  "general": {
+    "style_prefix_replace": [
+      {
+        "from": "MGTZ-",
+        "to": "MG-",
+        "enabled": true
+      }
+    ],
+    "split_auto_combo_styles": true,
+    "merge_same_style_attr": true,
+    "default_output_name": "报货汇总.xlsx",
+    "default_group_name": "未分组",
+    "show_group_headers": true,
+    "blank_row_between_styles": true
+  },
+  "color_map": {
+    "White": "白色",
+    "Black": "黑色",
+    "Grey": "灰色",
+    "Gray": "灰色",
+    "LightGrey": "浅灰",
+    "LightGray": "浅灰",
+    "DarkGrey": "深灰",
+    "DarkGray": "深灰",
+    "LightBlue": "浅蓝",
+    "SkyBlue": "天蓝",
+    "NavyBlue": "藏青",
+    "DarkBlue": "藏青",
+    "ArmyGreen": "军绿",
+    "Khaki": "卡其",
+    "Apricot": "杏色",
+    "PinkRed": "粉红",
+    "EarthyYellow": "土黄"
+  },
+  "rules": [
+    {
+      "enabled": true,
+      "name": "默认：自动识别款号，组合款自动拆款",
+      "priority": 1000,
+      "match_type": "regex",
+      "pattern": ".*",
+      "output_styles": "{auto}",
+      "color_mode": "keep",
+      "fixed_colors": "",
+      "qty_multiplier": 1,
+      "group_name": "自动识别",
+      "note": "兜底规则。例：MG-55+SSL-14-Black 自动拆成 MG-55 与 SSL-14。"
+    },
+    {
+      "enabled": true,
+      "name": "示例：同款双色拆分 MG-55-White+Khaki",
+      "priority": 100,
+      "match_type": "contains",
+      "pattern": "MG-55-White+Khaki",
+      "output_styles": "MG-55",
+      "color_mode": "sku_color",
+      "fixed_colors": "",
+      "qty_multiplier": 1.0,
+      "group_name": "MG系列",
+      "note": "启用后会把 MG-55-White+Khaki 拆成 MG-55 白色-尺码 与 MG-55 卡其色-尺码。"
+    },
+    {
+      "enabled": true,
+      "name": "示例：固定拆两个款式",
+      "priority": 100,
+      "match_type": "contains",
+      "pattern": "MG-55+SSL-14-Black",
+      "output_styles": "MG-55,SSL-14",
+      "color_mode": "keep",
+      "fixed_colors": "",
+      "qty_multiplier": 1.0,
+      "group_name": "套装拆分",
+      "note": "启用后会把这个 SKU 同时计入 MG-55 与 SSL-14。"
+    },
+    {
+      "enabled": true,
+      "name": "示例：按属性集拆色",
+      "priority": 100,
+      "match_type": "regex",
+      "pattern": "^MG-55-[A-Za-z]+(?:\\+[A-Za-z]+)+$",
+      "output_styles": "{auto}",
+      "color_mode": "sku_color",
+      "fixed_colors": "",
+      "qty_multiplier": 1.0,
+      "group_name": "双色拆分",
+      "note": "例：白色+黑色-XL 拆成 白色-XL 与 黑色-XL。"
+    }
+  ],
+  "group_rules": [
+    {
+      "enabled": true,
+      "name": "MG",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "MG-",
+      "group_name": "MG"
+    },
+    {
+      "enabled": true,
+      "name": "SSL",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "SSL-",
+      "group_name": "SSL"
+    },
+    {
+      "enabled": true,
+      "name": "XZ",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "XZ-",
+      "group_name": "XZ"
+    },
+    {
+      "enabled": true,
+      "name": "SK",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "SK-",
+      "group_name": "SK"
+    },
+    {
+      "enabled": true,
+      "name": "PG",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "PG-",
+      "group_name": "PG"
+    },
+    {
+      "enabled": true,
+      "name": "WW",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "WW-",
+      "group_name": "WW"
+    },
+    {
+      "enabled": true,
+      "name": "CW",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "CW-",
+      "group_name": "易峰宇"
+    },
+    {
+      "enabled": true,
+      "name": "YYCK",
+      "priority": 100,
+      "match_type": "startswith",
+      "pattern": "YYCK-",
+      "group_name": "林百姚"
+    }
+  ]
+}
