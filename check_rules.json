@@ -13,7 +13,17 @@
     "default_output_name": "报货汇总.xlsx",
     "default_group_name": "未分组",
     "show_group_headers": true,
-    "blank_row_between_styles": true
+    "blank_row_between_styles": true,
+    "style_code_replace": [
+      {
+        "enabled": true,
+        "from": "MG-55",
+        "to": "SK-015"
+      }
+    ],
+    "quantity_only_styles": [
+      "SK-015"
+    ]
   },
   "color_map": {
     "White": "白色",
@@ -37,33 +47,20 @@
   "rules": [
     {
       "enabled": true,
-      "name": "默认：自动识别款号，组合款自动拆款",
+      "name": "自动识别",
       "priority": 1000,
       "match_type": "regex",
       "pattern": ".*",
       "output_styles": "{auto}",
       "color_mode": "keep",
       "fixed_colors": "",
-      "qty_multiplier": 1,
+      "qty_multiplier": 1.0,
       "group_name": "自动识别",
       "note": "兜底规则。例：MG-55+SSL-14-Black 自动拆成 MG-55 与 SSL-14。"
     },
     {
       "enabled": true,
-      "name": "示例：同款双色拆分 MG-55-White+Khaki",
-      "priority": 100,
-      "match_type": "contains",
-      "pattern": "MG-55-White+Khaki",
-      "output_styles": "MG-55",
-      "color_mode": "sku_color",
-      "fixed_colors": "",
-      "qty_multiplier": 1.0,
-      "group_name": "MG系列",
-      "note": "启用后会把 MG-55-White+Khaki 拆成 MG-55 白色-尺码 与 MG-55 卡其色-尺码。"
-    },
-    {
-      "enabled": true,
-      "name": "示例：固定拆两个款式",
+      "name": "套装拆分",
       "priority": 100,
       "match_type": "contains",
       "pattern": "MG-55+SSL-14-Black",
@@ -76,7 +73,7 @@
     },
     {
       "enabled": true,
-      "name": "示例：按属性集拆色",
+      "name": "同款双色拆分",
       "priority": 100,
       "match_type": "regex",
       "pattern": "^MG-55-[A-Za-z]+(?:\\+[A-Za-z]+)+$",

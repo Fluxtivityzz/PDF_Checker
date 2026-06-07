@@ -48,9 +48,11 @@ except ImportError as e:
 # Tkinter 在部分精简 Python 环境中可能不存在；只有 GUI 模式才真正需要。
 try:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import ttk, filedialog, messagebox
 except Exception:  # pragma: no cover
     tk = None
+    tkfont = None
     ttk = None
     filedialog = None
     messagebox = None
@@ -74,6 +76,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "style_prefix_replace": [
             {"from": "MGTZ-", "to": "MG-", "enabled": True},
         ],
+        "style_code_replace": [],
+        "quantity_only_styles": [],
+        "quantity_only_group_name": "数量统计",
         "split_auto_combo_styles": True,
         "merge_same_style_attr": True,
         "default_output_name": "报货汇总.xlsx",
@@ -339,12 +344,26 @@ def parse_pdf_rows(pdf_path: Path) -> Tuple[List[ParsedRow], List[ParseIssue], s
                 sku_id = lines[j]
                 k = j + 1
                 sku_parts: List[str] = []
-                while k < len(lines) and not is_int(lines[k]):
-                    sku_parts.append(lines[k])
-                    k += 1
-                if k < len(lines) and sku_parts and is_int(lines[k]):
+
+                # 常规格式：SKU货号是字母/符号款号，下一行纯数字是数量。
+                # 兼容纯数字款号：SKU ID 后若出现连续两个纯数字，第一行是款号，第二行是数量。
+                if k + 1 < len(lines) and is_int(lines[k]) and is_int(lines[k + 1]):
+                    sku_code = lines[k].strip()
+                    qty = int(lines[k + 1])
+                    qty_line_index = k + 1
+                else:
+                    while k < len(lines) and not is_int(lines[k]):
+                        sku_parts.append(lines[k])
+                        k += 1
+                    if not (k < len(lines) and sku_parts and is_int(lines[k])):
+                        issues.append(ParseIssue(pdf_path.name, pages[i], "疑似属性行但未读取到 SKU货号/数量", line))
+                        i += 1
+                        continue
                     sku_code = "".join(sku_parts).strip()
                     qty = int(lines[k])
+                    qty_line_index = k
+
+                if sku_code:
                     rows.append(ParsedRow(
                         source_file=pdf_path.name,
                         page=pages[i],
@@ -353,10 +372,8 @@ def parse_pdf_rows(pdf_path: Path) -> Tuple[List[ParsedRow], List[ParseIssue], s
                         sku_code=sku_code,
                         qty=qty,
                     ))
-                    i = k + 1
+                    i = qty_line_index + 1
                     continue
-                else:
-                    issues.append(ParseIssue(pdf_path.name, pages[i], "疑似属性行但未读取到 SKU货号/数量", line))
         i += 1
 
     title = detect_report_date(lines_with_page)
@@ -374,7 +391,36 @@ def normalize_style(style: str, cfg: Dict[str, Any]) -> str:
         new = str(item.get("to", ""))
         if old and style.startswith(old):
             style = new + style[len(old):]
+    for item in cfg.get("general", {}).get("style_code_replace", []):
+        if not item.get("enabled", True):
+            continue
+        old = str(item.get("from", "")).strip()
+        new = str(item.get("to", "")).strip()
+        if old and new and style == old:
+            style = new
+            break
     return style
+
+
+def quantity_only_group_name(cfg: Dict[str, Any]) -> str:
+    name = str(cfg.get("general", {}).get("quantity_only_group_name", "数量统计") or "数量统计").strip()
+    return name or "数量统计"
+
+
+def quantity_only_style_set(cfg: Dict[str, Any]) -> set:
+    styles = cfg.get("general", {}).get("quantity_only_styles", [])
+    result = set()
+    if isinstance(styles, str):
+        styles = normalize_separator_list(styles)
+    for style in styles:
+        normalized = normalize_style(str(style), cfg).strip()
+        if normalized:
+            result.add(normalized)
+    return result
+
+
+def is_quantity_only_style(style: str, cfg: Dict[str, Any]) -> bool:
+    return normalize_style(style, cfg) in quantity_only_style_set(cfg)
 
 
 def get_auto_style_codes(sku_code: str, cfg: Dict[str, Any]) -> List[str]:
@@ -489,12 +535,15 @@ def rule_matches(rule: Dict[str, Any], sku_code: str) -> bool:
     if not pattern and match_type != "regex":
         return False
     try:
+        patterns = [pattern] if match_type == "regex" else normalize_separator_list(pattern)
+        if not patterns and pattern:
+            patterns = [pattern]
         if match_type == "exact":
-            return sku_code == pattern
+            return any(sku_code == p for p in patterns)
         if match_type == "startswith":
-            return sku_code.startswith(pattern)
+            return any(sku_code.startswith(p) for p in patterns)
         if match_type == "contains":
-            return pattern in sku_code
+            return any(p in sku_code for p in patterns)
         if match_type == "regex":
             return re.search(pattern, sku_code) is not None
     except re.error:
@@ -533,6 +582,8 @@ def sorted_group_rules(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def resolve_group_name(style: str, matched_rule: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     """按输出款号匹配分组规则；没有匹配时使用 SKU 规则中的分组名；仍为空则归为未分组。"""
+    if is_quantity_only_style(style, cfg):
+        return quantity_only_group_name(cfg)
     for gr in sorted_group_rules(cfg):
         if rule_matches(gr, style):
             name = str(gr.get("group_name", "")).strip()
@@ -621,7 +672,9 @@ def aggregate_output_rows(out_rows: List[OutputRow]) -> Tuple[OrderedDict, Dict[
     return groups, style_first_index, group_first_index
 
 
-def group_sort_key(group: str, group_first_index: Dict[str, int]) -> Tuple[int, str]:
+def group_sort_key(group: str, group_first_index: Dict[str, int], cfg: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
+    if cfg is not None and group == quantity_only_group_name(cfg):
+        return (-1, group)
     return (group_first_index.get(group, 999999), group)
 
 
@@ -684,15 +737,18 @@ def write_excel(
     show_group_headers = bool(cfg.get("general", {}).get("show_group_headers", True))
     blank_between = bool(cfg.get("general", {}).get("blank_row_between_styles", True))
 
-    for group in sorted(groups.keys(), key=lambda g: group_sort_key(g, group_first_index)):
+    for group in sorted(groups.keys(), key=lambda g: group_sort_key(g, group_first_index, cfg)):
         styles = groups[group]
-        group_styles = set(styles.keys())
+        group_styles = {style for style in styles.keys() if not is_quantity_only_style(style, cfg)}
         group_qty = sum(sum(attrs.values()) for attrs in styles.values())
 
         if show_group_headers:
             ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=4)
             cell = ws.cell(row=row_idx, column=1)
-            cell.value = f"分组：{group}    款数：{len(group_styles)}款    数量：{_fmt_qty(group_qty)}"
+            if group == quantity_only_group_name(cfg):
+                cell.value = f"{group}    数量：{_fmt_qty(group_qty)}"
+            else:
+                cell.value = f"{group}    款数：{len(group_styles)}款    数量：{_fmt_qty(group_qty)}"
             cell.font = Font(name="微软雅黑", size=11, bold=True)
             cell.alignment = Alignment(horizontal="left", vertical="center")
             cell.fill = group_fill
@@ -905,6 +961,27 @@ def process_pdfs(pdf_paths: List[Path], out_path: Path, cfg: Dict[str, Any]) -> 
 
 # ============================== GUI ==============================
 
+def enable_dpi_awareness() -> None:
+    """让 Windows 高缩放屏幕使用真实 DPI，避免界面被系统拉伸后发糊。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        try:
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            return
+        except Exception:
+            pass
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return
+        except Exception:
+            pass
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 if tk is not None:
     class RuleDialog(tk.Toplevel):
         def __init__(self, master, rule: Optional[Dict[str, Any]] = None):
@@ -1067,6 +1144,7 @@ if tk is not None:
             help_text = (
                 "说明：分组规则按‘输出款号’匹配，不按 PDF 原始 SKU 匹配。\n"
                 "例：匹配方式 startswith，匹配款号 MG-，分组名称 MG系列，所有 MG- 开头的款会排在一起。\n"
+                "多个匹配款号可用逗号分隔，例如 CW-,YYCK- 会归到同一个分组。\n"
                 "如果同一个款号命中多个分组规则，优先级数字越小越先使用。"
             )
             ttk.Label(frm, text=help_text, justify="left", foreground="#555").grid(row=row, column=0, columnspan=2, sticky="w", **pad)
@@ -1100,111 +1178,369 @@ if tk is not None:
 
     class BaohuoApp(tk.Tk):
         def __init__(self):
+            enable_dpi_awareness()
             super().__init__()
             self.title(APP_NAME)
-            self.geometry("1120x720")
-            self.minsize(980, 640)
             self.cfg_path = default_config_path()
             self.cfg = load_config(self.cfg_path)
             self.pdf_paths: List[Path] = []
+            self.processing = False
+            self.last_output_path: Optional[Path] = None
+            self._configure_window_metrics()
+            self._apply_theme()
             self._build_ui()
             self.refresh_rules_tree()
             self.refresh_group_rules_tree()
             self.refresh_color_table()
             self.refresh_prefix_table()
+            self.refresh_style_code_table()
+            self.refresh_quantity_only_table()
+            self.refresh_pdf_tree()
+
+        def _configure_window_metrics(self):
+            screen_w = max(self.winfo_screenwidth(), 900)
+            screen_h = max(self.winfo_screenheight(), 640)
+            usable_w = max(screen_w - 80, 900)
+            usable_h = max(screen_h - 110, 620)
+
+            target_w = min(max(int(screen_w * 0.78), 1120), 1560, usable_w)
+            target_h = min(max(int(screen_h * 0.78), 720), 980, usable_h)
+            min_w = min(1020, usable_w)
+            min_h = min(660, usable_h)
+
+            x = max((screen_w - target_w) // 2, 0)
+            y = max((screen_h - target_h) // 2, 0)
+            self.geometry(f"{target_w}x{target_h}+{x}+{y}")
+            self.minsize(min_w, min_h)
+            self.compact_ui = target_w < 1160 or target_h < 720
+
+            try:
+                dpi_scale = float(self.winfo_fpixels("1i")) / 72.0
+                self.tk.call("tk", "scaling", max(1.0, min(dpi_scale, 2.4)))
+            except Exception:
+                pass
+
+        def _choose_font_family(self) -> str:
+            preferred = ["PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑"]
+            if tkfont is not None:
+                families = {name.lower(): name for name in tkfont.families(self)}
+                for name in preferred:
+                    if name.lower() in families:
+                        return families[name.lower()]
+            return "Microsoft YaHei UI"
+
+        def _apply_theme(self):
+            self.colors = {
+                "bg": "#111318",
+                "panel": "#181B22",
+                "panel_2": "#20242D",
+                "control": "#252A34",
+                "control_hover": "#303744",
+                "control_active": "#384150",
+                "input_bg": "#141922",
+                "input_focus": "#1A202B",
+                "text": "#F2F4F8",
+                "muted": "#AAB1C0",
+                "accent": "#D6B46A",
+                "accent_hover": "#E2C47B",
+                "accent_active": "#C9A75E",
+                "border": "#303643",
+                "disabled": "#6F7785",
+                "danger": "#E06C75",
+                "log_text": "#D7DBE5",
+            }
+            c = self.colors
+            self.configure(bg=c["bg"])
+            self.style = ttk.Style(self)
+            try:
+                self.style.theme_use("clam")
+            except tk.TclError:
+                pass
+            self.font_family = self._choose_font_family()
+            base_size = 9 if self.compact_ui else 10
+            title_size = 16 if self.compact_ui else 18
+            small_size = 8 if self.compact_ui else 9
+            row_height = 26 if self.compact_ui else 28
+            base_font = (self.font_family, base_size)
+            title_font = (self.font_family, title_size, "bold")
+            small_font = (self.font_family, small_size)
+            self.option_add("*Font", base_font)
+            self.option_add("*TCombobox*Listbox.background", c["control"])
+            self.option_add("*TCombobox*Listbox.foreground", c["text"])
+            self.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+            self.option_add("*TCombobox*Listbox.selectForeground", c["bg"])
+            self.option_add("*TCombobox*Listbox.borderWidth", 0)
+            self.style.configure(".", font=base_font, background=c["bg"], foreground=c["text"])
+            self.style.configure("App.TFrame", background=c["bg"])
+            self.style.configure("Panel.TFrame", background=c["panel"])
+            self.style.configure("Toolbar.TFrame", background=c["panel"])
+            self.style.configure("Title.TLabel", font=title_font, background=c["bg"], foreground=c["text"])
+            self.style.configure("Subtitle.TLabel", font=small_font, background=c["bg"], foreground=c["muted"])
+            self.style.configure("PanelTitle.TLabel", font=(self.font_family, base_size + 1, "bold"), background=c["panel"], foreground=c["accent"])
+            self.style.configure("Muted.TLabel", font=small_font, background=c["panel"], foreground=c["muted"])
+            self.style.configure("Status.TLabel", font=small_font, background=c["panel_2"], foreground=c["accent"])
+            self.style.configure("TButton", padding=((10 if self.compact_ui else 12), (6 if self.compact_ui else 7)), relief="flat", background=c["control"], foreground=c["text"], bordercolor=c["control"], darkcolor=c["control"], lightcolor=c["control"], focuscolor=c["control"])
+            self.style.map("TButton", background=[("disabled", c["panel_2"]), ("pressed", c["control_active"]), ("active", c["control_hover"])], foreground=[("disabled", c["disabled"])], bordercolor=[("pressed", c["control_active"]), ("active", c["control_hover"])])
+            self.style.configure("Accent.TButton", padding=((13 if self.compact_ui else 16), (7 if self.compact_ui else 8)), background=c["accent"], foreground=c["bg"], bordercolor=c["accent"], darkcolor=c["accent"], lightcolor=c["accent"], focuscolor=c["accent"])
+            self.style.map("Accent.TButton", background=[("disabled", "#6F654C"), ("pressed", c["accent_active"]), ("active", c["accent_hover"])], foreground=[("disabled", "#2A261D")], bordercolor=[("pressed", c["accent_active"]), ("active", c["accent_hover"])])
+            self.style.configure("Danger.TButton", padding=((10 if self.compact_ui else 12), (6 if self.compact_ui else 7)), foreground=c["danger"], background=c["control"], bordercolor=c["control"])
+            self.style.configure("Nav.TButton", padding=(10, 9), anchor="w", background=c["panel"], foreground=c["muted"], bordercolor=c["panel"], darkcolor=c["panel"], lightcolor=c["panel"])
+            self.style.map("Nav.TButton", background=[("active", c["panel_2"])], foreground=[("active", c["text"])])
+            self.style.configure("ActiveNav.TButton", padding=(10, 9), anchor="w", background=c["panel_2"], foreground=c["accent"], bordercolor=c["panel_2"], darkcolor=c["panel_2"], lightcolor=c["panel_2"])
+            self.style.map("ActiveNav.TButton", background=[("active", c["panel_2"])], foreground=[("active", c["accent"])])
+            self.style.configure("TEntry", fieldbackground=c["input_bg"], background=c["input_bg"], foreground=c["text"], insertcolor=c["text"], bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"], relief="flat")
+            self.style.map("TEntry", fieldbackground=[("focus", c["input_focus"])], bordercolor=[("focus", c["accent"])], lightcolor=[("focus", c["accent"])], darkcolor=[("focus", c["accent"])])
+            self.style.configure("TCombobox", fieldbackground=c["control"], background=c["control"], foreground=c["text"], selectforeground=c["text"], selectbackground=c["control"], arrowcolor=c["muted"], bordercolor=c["control"], darkcolor=c["control"], lightcolor=c["control"], relief="flat")
+            self.style.map("TCombobox", fieldbackground=[("readonly", c["control"]), ("focus", c["control_hover"]), ("active", c["control_hover"])], background=[("readonly", c["control"]), ("pressed", c["control_active"]), ("active", c["control_hover"])], foreground=[("readonly", c["text"])], selectforeground=[("readonly", c["text"])], selectbackground=[("readonly", c["control"])], arrowcolor=[("active", c["text"]), ("readonly", c["muted"])], bordercolor=[("focus", c["accent"]), ("active", c["control_hover"])])
+            self.style.configure("Treeview", font=base_font, rowheight=row_height, background=c["panel"], fieldbackground=c["panel"], foreground=c["text"], borderwidth=0)
+            self.style.configure("Treeview.Heading", font=(self.font_family, base_size, "bold"), padding=(6, 7), background=c["panel_2"], foreground=c["accent"], bordercolor=c["border"])
+            self.style.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", c["bg"])])
+            self.style.configure("Vertical.TScrollbar", background=c["control"], darkcolor=c["control"], lightcolor=c["control"], troughcolor=c["bg"], bordercolor=c["bg"], arrowcolor=c["muted"], relief="flat", arrowsize=12)
+            self.style.configure("Horizontal.TScrollbar", background=c["control"], darkcolor=c["control"], lightcolor=c["control"], troughcolor=c["bg"], bordercolor=c["bg"], arrowcolor=c["muted"], relief="flat", arrowsize=12)
 
         def _build_ui(self):
-            self.nb = ttk.Notebook(self)
-            self.nb.pack(fill="both", expand=True)
-            self.tab_process = ttk.Frame(self.nb)
-            self.tab_rules = ttk.Frame(self.nb)
-            self.tab_groups = ttk.Frame(self.nb)
-            self.tab_color = ttk.Frame(self.nb)
-            self.nb.add(self.tab_process, text="处理PDF")
-            self.nb.add(self.tab_rules, text="SKU/套装规则")
-            self.nb.add(self.tab_groups, text="分组设置")
-            self.nb.add(self.tab_color, text="颜色映射/款号替换")
+            page_pad = 12 if self.compact_ui else 18
+            header_y = (10, 6) if self.compact_ui else (16, 8)
+            bottom_y = (0, 10) if self.compact_ui else (0, 14)
+            self.status_var = tk.StringVar(value="就绪")
+            self.pdf_count_var = tk.StringVar(value="0 个 PDF")
+            self.result_summary_var = tk.StringVar(value="尚未处理")
+            self.config_state_var = tk.StringVar(value=f"配置：{self.cfg_path.name}")
+
+            root = ttk.Frame(self, style="App.TFrame")
+            root.pack(fill="both", expand=True)
+
+            header = ttk.Frame(root, style="App.TFrame")
+            header.pack(fill="x", padx=page_pad, pady=header_y)
+            ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
+            ttk.Label(header, textvariable=self.config_state_var, style="Subtitle.TLabel").pack(side="right", pady=(8, 0))
+
+            main = ttk.Frame(root, style="App.TFrame")
+            main.pack(fill="both", expand=True, padx=page_pad, pady=(0, 10 if self.compact_ui else 12))
+            nav_width = 132 if self.compact_ui else 156
+            nav = ttk.Frame(main, style="Panel.TFrame", padding=8)
+            nav.pack(side="left", fill="y", padx=(0, 10 if self.compact_ui else 12))
+            nav.pack_propagate(False)
+            nav.configure(width=nav_width)
+
+            self.content_stack = ttk.Frame(main, style="App.TFrame")
+            self.content_stack.pack(side="left", fill="both", expand=True)
+            self.content_stack.rowconfigure(0, weight=1)
+            self.content_stack.columnconfigure(0, weight=1)
+
+            self.nav_buttons: Dict[str, ttk.Button] = {}
+            nav_items = [
+                ("process", "处理PDF"),
+                ("rules", "SKU规则"),
+                ("groups", "分组设置"),
+                ("color", "颜色/前缀"),
+            ]
+            for key, label in nav_items:
+                btn = ttk.Button(nav, text=label, style="Nav.TButton", command=lambda k=key: self._show_page(k))
+                btn.pack(fill="x", pady=(0, 6))
+                self.nav_buttons[key] = btn
+
+            self.tab_process = ttk.Frame(self.content_stack, style="App.TFrame")
+            self.tab_rules = ttk.Frame(self.content_stack, style="App.TFrame")
+            self.tab_groups = ttk.Frame(self.content_stack, style="App.TFrame")
+            self.tab_color = ttk.Frame(self.content_stack, style="App.TFrame")
+            self.pages = {
+                "process": self.tab_process,
+                "rules": self.tab_rules,
+                "groups": self.tab_groups,
+                "color": self.tab_color,
+            }
+            for page in self.pages.values():
+                page.grid(row=0, column=0, sticky="nsew")
             self._build_process_tab()
             self._build_rules_tab()
             self._build_group_tab()
             self._build_color_tab()
+            self._show_page("process")
+
+            status = ttk.Frame(root, style="App.TFrame")
+            status.pack(fill="x", padx=page_pad, pady=bottom_y)
+            ttk.Label(status, textvariable=self.status_var, style="Status.TLabel", anchor="w").pack(fill="x", ipady=5)
+
+        def _panel(self, parent) -> ttk.Frame:
+            panel = ttk.Frame(parent, style="Panel.TFrame", padding=8 if self.compact_ui else 12)
+            return panel
+
+        def _show_page(self, key: str):
+            page = self.pages.get(key)
+            if page is None:
+                return
+            page.tkraise()
+            for nav_key, btn in self.nav_buttons.items():
+                btn.configure(style="ActiveNav.TButton" if nav_key == key else "Nav.TButton")
+
+        def _set_status(self, text: str):
+            self.status_var.set(text)
+            self.update_idletasks()
+
+        def _mark_config_dirty(self):
+            self.config_state_var.set(f"配置：{self.cfg_path.name}（未保存）")
+
+        def _default_output_path(self) -> Path:
+            output_name = str(self.cfg.get("general", {}).get("default_output_name", "报货汇总.xlsx") or "报货汇总.xlsx")
+            base = self.pdf_paths[0].parent if self.pdf_paths else Path.cwd()
+            return (base / output_name).resolve()
+
+        def _set_busy(self, busy: bool):
+            self.processing = busy
+            state = "disabled" if busy else "normal"
+            for btn in (getattr(self, "run_btn", None), getattr(self, "add_pdf_btn", None), getattr(self, "add_folder_btn", None)):
+                if btn is not None:
+                    btn.configure(state=state)
 
         def _build_process_tab(self):
-            top = ttk.Frame(self.tab_process)
-            top.pack(fill="x", padx=10, pady=8)
-            ttk.Button(top, text="添加PDF", command=self.add_pdfs).pack(side="left", padx=4)
-            ttk.Button(top, text="添加文件夹", command=self.add_folder).pack(side="left", padx=4)
-            ttk.Button(top, text="移除选中", command=self.remove_selected_pdf).pack(side="left", padx=4)
-            ttk.Button(top, text="清空", command=self.clear_pdfs).pack(side="left", padx=4)
+            container = ttk.Frame(self.tab_process, style="App.TFrame", padding=(0, 12, 0, 0))
+            container.pack(fill="both", expand=True)
 
-            mid = ttk.Frame(self.tab_process)
-            mid.pack(fill="both", expand=True, padx=10, pady=4)
-            self.pdf_tree = ttk.Treeview(mid, columns=("path",), show="headings", height=12)
-            self.pdf_tree.heading("path", text="待处理PDF")
-            self.pdf_tree.column("path", width=900, anchor="w")
+            toolbar = self._panel(container)
+            toolbar.pack(fill="x", padx=0, pady=(0, 10))
+            ttk.Label(toolbar, text="PDF 队列", style="PanelTitle.TLabel").pack(side="left", padx=(0, 12))
+            ttk.Label(toolbar, textvariable=self.pdf_count_var, style="Muted.TLabel").pack(side="left")
+            self.add_pdf_btn = ttk.Button(toolbar, text="添加PDF", command=self.add_pdfs)
+            self.add_pdf_btn.pack(side="right", padx=(6, 0))
+            self.add_folder_btn = ttk.Button(toolbar, text="添加文件夹", command=self.add_folder)
+            self.add_folder_btn.pack(side="right", padx=(6, 0))
+            self.remove_pdf_btn = ttk.Button(toolbar, text="移除选中", command=self.remove_selected_pdf)
+            self.remove_pdf_btn.pack(side="right", padx=(6, 0))
+            self.clear_pdf_btn = ttk.Button(toolbar, text="清空", command=self.clear_pdfs, style="Danger.TButton")
+            self.clear_pdf_btn.pack(side="right", padx=(6, 0))
+
+            list_panel = self._panel(container)
+            list_panel.pack(fill="both", expand=True, padx=0, pady=(0, 10))
+            cols = ("name", "folder", "path")
+            self.pdf_tree = ttk.Treeview(list_panel, columns=cols, show="headings", height=11, selectmode="extended")
+            self.pdf_tree.heading("name", text="文件名")
+            self.pdf_tree.heading("folder", text="所在目录")
+            self.pdf_tree.heading("path", text="")
+            self.pdf_tree.column("name", width=260, anchor="w")
+            self.pdf_tree.column("folder", width=760, anchor="w")
+            self.pdf_tree.column("path", width=0, minwidth=0, stretch=False)
             self.pdf_tree.pack(side="left", fill="both", expand=True)
-            sb = ttk.Scrollbar(mid, orient="vertical", command=self.pdf_tree.yview)
+            sb = ttk.Scrollbar(list_panel, orient="vertical", command=self.pdf_tree.yview)
             self.pdf_tree.configure(yscrollcommand=sb.set)
             sb.pack(side="right", fill="y")
+            self.pdf_tree.bind("<Delete>", lambda e: self.remove_selected_pdf())
 
-            outfrm = ttk.Frame(self.tab_process)
-            outfrm.pack(fill="x", padx=10, pady=8)
-            ttk.Label(outfrm, text="输出Excel：").pack(side="left")
-            self.output_var = tk.StringVar(value=str((Path.cwd() / "报货汇总.xlsx").resolve()))
-            ttk.Entry(outfrm, textvariable=self.output_var).pack(side="left", fill="x", expand=True, padx=6)
-            ttk.Button(outfrm, text="选择位置", command=self.choose_output).pack(side="left", padx=4)
-            ttk.Button(outfrm, text="开始处理", command=self.run_process).pack(side="left", padx=4)
+            output_panel = self._panel(container)
+            output_panel.pack(fill="x", padx=0, pady=(0, 10))
+            ttk.Label(output_panel, text="输出 Excel", style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            self.output_var = tk.StringVar(value=str(self._default_output_path()))
+            output_entry = ttk.Entry(output_panel, textvariable=self.output_var)
+            output_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+            ttk.Button(output_panel, text="选择位置", command=self.choose_output).grid(row=1, column=1, padx=(0, 8))
+            self.run_btn = ttk.Button(output_panel, text="开始处理", command=self.run_process, style="Accent.TButton")
+            self.run_btn.grid(row=1, column=2)
+            self.open_output_btn = ttk.Button(output_panel, text="打开输出目录", command=self.open_output_folder, state="disabled")
+            self.open_output_btn.grid(row=1, column=3, padx=(8, 0))
+            ttk.Label(output_panel, textvariable=self.result_summary_var, style="Muted.TLabel").grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+            output_panel.columnconfigure(0, weight=1)
 
-            logfrm = ttk.LabelFrame(self.tab_process, text="日志")
-            logfrm.pack(fill="both", expand=True, padx=10, pady=8)
-            self.log = tk.Text(logfrm, height=10)
-            self.log.pack(fill="both", expand=True)
+            log_panel = self._panel(container)
+            log_panel.pack(fill="both", expand=True)
+            log_header = ttk.Frame(log_panel, style="Panel.TFrame")
+            log_header.pack(fill="x", pady=(0, 8))
+            ttk.Label(log_header, text="运行日志", style="PanelTitle.TLabel").pack(side="left")
+            ttk.Button(log_header, text="清空日志", command=self.clear_log).pack(side="right")
+            c = self.colors
+            self.log = tk.Text(log_panel, height=8, bg=c["input_bg"], fg=c["log_text"], insertbackground=c["log_text"], relief="flat", highlightthickness=1, highlightbackground=c["border"], highlightcolor=c["accent"], wrap="word")
+            self.log.pack(side="left", fill="both", expand=True)
+            log_sb = ttk.Scrollbar(log_panel, orient="vertical", command=self.log.yview)
+            self.log.configure(yscrollcommand=log_sb.set)
+            log_sb.pack(side="right", fill="y")
 
         def _build_rules_tab(self):
-            btnfrm = ttk.Frame(self.tab_rules)
-            btnfrm.pack(fill="x", padx=10, pady=8)
-            ttk.Button(btnfrm, text="新增规则", command=self.add_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="编辑选中", command=self.edit_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="删除选中", command=self.delete_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="保存规则", command=self.save_all_config).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="导入配置", command=self.import_config).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="导出配置", command=self.export_config).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="恢复默认配置", command=self.reset_config).pack(side="left", padx=4)
+            container = ttk.Frame(self.tab_rules, style="App.TFrame", padding=(0, 12, 0, 0))
+            container.pack(fill="both", expand=True)
+            btnfrm = self._panel(container)
+            btnfrm.pack(fill="x", pady=(0, 10))
+            ttk.Label(btnfrm, text="SKU / 套装规则", style="PanelTitle.TLabel").pack(side="left", padx=(0, 12))
+            ttk.Button(btnfrm, text="新增", command=self.add_rule).pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="编辑", command=self.edit_rule).pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="删除", command=self.delete_rule, style="Danger.TButton").pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="恢复默认", command=self.reset_config).pack(side="right", padx=(6, 0))
+            ttk.Button(btnfrm, text="导出配置", command=self.export_config).pack(side="right", padx=(6, 0))
+            ttk.Button(btnfrm, text="导入配置", command=self.import_config).pack(side="right", padx=(6, 0))
+            ttk.Button(btnfrm, text="保存配置", command=self.save_all_config, style="Accent.TButton").pack(side="right", padx=(6, 0))
 
-            cols = ("enabled", "priority", "name", "group", "match_type", "pattern", "output_styles", "color_mode", "fixed_colors", "multiplier", "note")
-            self.rules_tree = ttk.Treeview(self.tab_rules, columns=cols, show="headings")
-            headings = {
-                "enabled": "启用", "priority": "优先级", "name": "规则名", "group": "默认分组", "match_type": "匹配方式",
-                "pattern": "匹配内容", "output_styles": "输出款号", "color_mode": "颜色模式",
-                "fixed_colors": "固定颜色", "multiplier": "倍数", "note": "备注"
-            }
-            widths = {"enabled": 50, "priority": 60, "name": 210, "group": 120, "match_type": 90, "pattern": 160,
-                      "output_styles": 150, "color_mode": 120, "fixed_colors": 140, "multiplier": 60, "note": 260}
+            body = ttk.PanedWindow(container, orient="horizontal")
+            body.pack(fill="both", expand=True)
+
+            list_panel = self._panel(body)
+            detail_panel = self._panel(body)
+            body.add(list_panel, weight=2)
+            body.add(detail_panel, weight=3)
+
+            ttk.Label(list_panel, text="规则列表", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 8))
+            cols = ("state", "priority", "name")
+            self.rules_tree = ttk.Treeview(list_panel, columns=cols, show="headings", selectmode="browse")
+            headings = {"state": "状态", "priority": "优先级", "name": "规则名"}
+            widths = {"state": 58, "priority": 70, "name": 360 if not self.compact_ui else 280}
             for col in cols:
                 self.rules_tree.heading(col, text=headings[col])
-                self.rules_tree.column(col, width=widths[col], anchor="center")
-            self.rules_tree.pack(fill="both", expand=True, padx=10, pady=5)
+                self.rules_tree.column(col, width=widths[col], anchor="center" if col != "name" else "w", stretch=(col == "name"))
+            self.rules_tree.pack(side="left", fill="both", expand=True)
+            rules_sb = ttk.Scrollbar(list_panel, orient="vertical", command=self.rules_tree.yview)
+            self.rules_tree.configure(yscrollcommand=rules_sb.set)
+            rules_sb.pack(side="right", fill="y")
             self.rules_tree.bind("<Double-1>", lambda e: self.edit_rule())
+            self.rules_tree.bind("<Delete>", lambda e: self.delete_rule())
+            self.rules_tree.bind("<<TreeviewSelect>>", lambda e: self.refresh_rule_detail())
+
+            ttk.Label(detail_panel, text="规则详情", style="PanelTitle.TLabel").pack(anchor="w", pady=(0, 8))
+            self.rule_detail_title_var = tk.StringVar(value="请选择一条规则")
+            self.rule_detail_meta_var = tk.StringVar(value="")
+            ttk.Label(detail_panel, textvariable=self.rule_detail_title_var, style="PanelTitle.TLabel", wraplength=520, justify="left").pack(anchor="w")
+            ttk.Label(detail_panel, textvariable=self.rule_detail_meta_var, style="Muted.TLabel", wraplength=520, justify="left").pack(anchor="w", pady=(3, 12))
+            self.rule_detail_fields: Dict[str, tk.StringVar] = {}
+            detail_fields = [
+                ("匹配方式", "match_type"),
+                ("匹配内容", "pattern"),
+                ("输出款号", "output_styles"),
+                ("颜色模式", "color_mode"),
+                ("固定颜色", "fixed_colors"),
+                ("默认分组", "group_name"),
+                ("数量倍数", "qty_multiplier"),
+                ("备注", "note"),
+            ]
+            grid = ttk.Frame(detail_panel, style="Panel.TFrame")
+            grid.pack(fill="both", expand=True)
+            for row, (label, key) in enumerate(detail_fields):
+                ttk.Label(grid, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="ne", padx=(0, 12), pady=5)
+                var = tk.StringVar(value="")
+                self.rule_detail_fields[key] = var
+                ttk.Label(grid, textvariable=var, background=self.colors["panel"], foreground=self.colors["text"], wraplength=620, justify="left").grid(row=row, column=1, sticky="nw", pady=5)
+            grid.columnconfigure(1, weight=1)
 
         def _build_group_tab(self):
-            btnfrm = ttk.Frame(self.tab_groups)
-            btnfrm.pack(fill="x", padx=10, pady=8)
-            ttk.Button(btnfrm, text="新增分组规则", command=self.add_group_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="编辑选中", command=self.edit_group_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="删除选中", command=self.delete_group_rule).pack(side="left", padx=4)
-            ttk.Button(btnfrm, text="保存配置", command=self.save_all_config).pack(side="left", padx=4)
+            container = ttk.Frame(self.tab_groups, style="App.TFrame", padding=(0, 12, 0, 0))
+            container.pack(fill="both", expand=True)
+            btnfrm = self._panel(container)
+            btnfrm.pack(fill="x", pady=(0, 10))
+            ttk.Label(btnfrm, text="分组设置", style="PanelTitle.TLabel").pack(side="left", padx=(0, 12))
+            ttk.Button(btnfrm, text="新增", command=self.add_group_rule).pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="编辑", command=self.edit_group_rule).pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="删除", command=self.delete_group_rule, style="Danger.TButton").pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="保存配置", command=self.save_all_config, style="Accent.TButton").pack(side="right")
 
-            tip = ttk.Label(
-                self.tab_groups,
-                text="分组规则按最终输出款号匹配。例：MG- 开头归到 MG系列，SSL- 开头归到 SSL系列。输出 Excel 会先按分组归类，再按款号统计，并在每个款号之间空一行。",
-                foreground="#555",
+            tip_panel = self._panel(container)
+            tip_panel.pack(fill="x", pady=(0, 10))
+            ttk.Label(
+                tip_panel,
+                text="分组规则按最终输出款号匹配。匹配款号可写多个，用逗号分隔，例如 CW-,YYCK-；优先级数字越小越先使用。",
+                style="Muted.TLabel",
                 wraplength=1050,
                 justify="left",
-            )
-            tip.pack(fill="x", padx=10, pady=(0, 6))
+            ).pack(fill="x")
 
             cols = ("enabled", "priority", "name", "match_type", "pattern", "group")
-            self.group_tree = ttk.Treeview(self.tab_groups, columns=cols, show="headings")
+            table = self._panel(container)
+            table.pack(fill="both", expand=True)
+            self.group_tree = ttk.Treeview(table, columns=cols, show="headings")
             headings = {
                 "enabled": "启用", "priority": "优先级", "name": "规则名", "match_type": "匹配方式",
                 "pattern": "匹配款号", "group": "分组名称"
@@ -1212,47 +1548,120 @@ if tk is not None:
             widths = {"enabled": 60, "priority": 80, "name": 260, "match_type": 120, "pattern": 260, "group": 180}
             for col in cols:
                 self.group_tree.heading(col, text=headings[col])
-                self.group_tree.column(col, width=widths[col], anchor="center")
-            self.group_tree.pack(fill="both", expand=True, padx=10, pady=5)
+                self.group_tree.column(col, width=widths[col], anchor="center", stretch=False)
+            self.group_tree.grid(row=0, column=0, sticky="nsew")
+            group_sb = ttk.Scrollbar(table, orient="vertical", command=self.group_tree.yview)
+            group_xsb = ttk.Scrollbar(table, orient="horizontal", command=self.group_tree.xview)
+            self.group_tree.configure(yscrollcommand=group_sb.set, xscrollcommand=group_xsb.set)
+            group_sb.grid(row=0, column=1, sticky="ns")
+            group_xsb.grid(row=1, column=0, sticky="ew")
+            table.rowconfigure(0, weight=1)
+            table.columnconfigure(0, weight=1)
             self.group_tree.bind("<Double-1>", lambda e: self.edit_group_rule())
+            self.group_tree.bind("<Delete>", lambda e: self.delete_group_rule())
 
         def _build_color_tab(self):
-            main = ttk.Frame(self.tab_color)
-            main.pack(fill="both", expand=True, padx=10, pady=10)
+            main = ttk.Frame(self.tab_color, style="App.TFrame", padding=(0, 12, 0, 0))
+            main.pack(fill="both", expand=True)
+            for r in range(2):
+                main.rowconfigure(r, weight=1)
+            for c in range(2):
+                main.columnconfigure(c, weight=1)
 
-            left = ttk.LabelFrame(main, text="英文颜色 → 中文颜色")
-            left.pack(side="left", fill="both", expand=True, padx=(0, 6))
-            self.color_tree = ttk.Treeview(left, columns=("en", "cn"), show="headings")
+            color_panel = self._panel(main)
+            color_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+            color_header = ttk.Frame(color_panel, style="Panel.TFrame")
+            color_header.pack(fill="x", pady=(0, 8))
+            ttk.Label(color_header, text="英文颜色 → 中文颜色", style="PanelTitle.TLabel").pack(side="left")
+            ttk.Button(color_header, text="新增/修改", command=self.edit_color).pack(side="right", padx=(6, 0))
+            ttk.Button(color_header, text="删除", command=self.delete_color, style="Danger.TButton").pack(side="right")
+            self.color_tree = ttk.Treeview(color_panel, columns=("en", "cn"), show="headings")
             self.color_tree.heading("en", text="英文颜色")
             self.color_tree.heading("cn", text="中文颜色")
-            self.color_tree.column("en", width=160, anchor="center")
-            self.color_tree.column("cn", width=160, anchor="center")
-            self.color_tree.pack(fill="both", expand=True, padx=6, pady=6)
-            cbtn = ttk.Frame(left)
-            cbtn.pack(fill="x", padx=6, pady=6)
-            ttk.Button(cbtn, text="新增/修改颜色", command=self.edit_color).pack(side="left", padx=3)
-            ttk.Button(cbtn, text="删除颜色", command=self.delete_color).pack(side="left", padx=3)
+            self.color_tree.column("en", width=150, anchor="center")
+            self.color_tree.column("cn", width=150, anchor="center")
+            self.color_tree.pack(side="left", fill="both", expand=True)
+            color_sb = ttk.Scrollbar(color_panel, orient="vertical", command=self.color_tree.yview)
+            self.color_tree.configure(yscrollcommand=color_sb.set)
+            color_sb.pack(side="right", fill="y")
+            self.color_tree.bind("<Double-1>", lambda e: self.edit_color())
+            self.color_tree.bind("<Delete>", lambda e: self.delete_color())
 
-            right = ttk.LabelFrame(main, text="款号前缀替换")
-            right.pack(side="left", fill="both", expand=True, padx=(6, 0))
-            self.prefix_tree = ttk.Treeview(right, columns=("enabled", "from", "to"), show="headings")
+            prefix_panel = self._panel(main)
+            prefix_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+            prefix_header = ttk.Frame(prefix_panel, style="Panel.TFrame")
+            prefix_header.pack(fill="x", pady=(0, 8))
+            ttk.Label(prefix_header, text="款号前缀替换", style="PanelTitle.TLabel").pack(side="left")
+            ttk.Button(prefix_header, text="新增/修改", command=self.edit_prefix).pack(side="right", padx=(6, 0))
+            ttk.Button(prefix_header, text="删除", command=self.delete_prefix, style="Danger.TButton").pack(side="right")
+            self.prefix_tree = ttk.Treeview(prefix_panel, columns=("enabled", "from", "to"), show="headings")
             self.prefix_tree.heading("enabled", text="启用")
             self.prefix_tree.heading("from", text="原前缀")
             self.prefix_tree.heading("to", text="替换为")
             self.prefix_tree.column("enabled", width=60, anchor="center")
-            self.prefix_tree.column("from", width=160, anchor="center")
-            self.prefix_tree.column("to", width=160, anchor="center")
-            self.prefix_tree.pack(fill="both", expand=True, padx=6, pady=6)
-            pbtn = ttk.Frame(right)
-            pbtn.pack(fill="x", padx=6, pady=6)
-            ttk.Button(pbtn, text="新增/修改替换", command=self.edit_prefix).pack(side="left", padx=3)
-            ttk.Button(pbtn, text="删除替换", command=self.delete_prefix).pack(side="left", padx=3)
-            ttk.Button(pbtn, text="保存配置", command=self.save_all_config).pack(side="left", padx=3)
+            self.prefix_tree.column("from", width=140, anchor="center")
+            self.prefix_tree.column("to", width=140, anchor="center")
+            self.prefix_tree.pack(side="left", fill="both", expand=True)
+            prefix_sb = ttk.Scrollbar(prefix_panel, orient="vertical", command=self.prefix_tree.yview)
+            self.prefix_tree.configure(yscrollcommand=prefix_sb.set)
+            prefix_sb.pack(side="right", fill="y")
+            self.prefix_tree.bind("<Double-1>", lambda e: self.edit_prefix())
+            self.prefix_tree.bind("<Delete>", lambda e: self.delete_prefix())
+
+            style_panel = self._panel(main)
+            style_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
+            style_header = ttk.Frame(style_panel, style="Panel.TFrame")
+            style_header.pack(fill="x", pady=(0, 8))
+            ttk.Label(style_header, text="款号对照替换", style="PanelTitle.TLabel").pack(side="left")
+            ttk.Button(style_header, text="新增/修改", command=self.edit_style_code_replace).pack(side="right", padx=(6, 0))
+            ttk.Button(style_header, text="删除", command=self.delete_style_code_replace, style="Danger.TButton").pack(side="right")
+            self.style_code_tree = ttk.Treeview(style_panel, columns=("enabled", "from", "to"), show="headings")
+            self.style_code_tree.heading("enabled", text="启用")
+            self.style_code_tree.heading("from", text="原款号")
+            self.style_code_tree.heading("to", text="替换为")
+            self.style_code_tree.column("enabled", width=60, anchor="center")
+            self.style_code_tree.column("from", width=140, anchor="center")
+            self.style_code_tree.column("to", width=140, anchor="center")
+            self.style_code_tree.pack(side="left", fill="both", expand=True)
+            style_sb = ttk.Scrollbar(style_panel, orient="vertical", command=self.style_code_tree.yview)
+            self.style_code_tree.configure(yscrollcommand=style_sb.set)
+            style_sb.pack(side="right", fill="y")
+            self.style_code_tree.bind("<Double-1>", lambda e: self.edit_style_code_replace())
+            self.style_code_tree.bind("<Delete>", lambda e: self.delete_style_code_replace())
+
+            quantity_panel = self._panel(main)
+            quantity_panel.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0))
+            quantity_header = ttk.Frame(quantity_panel, style="Panel.TFrame")
+            quantity_header.pack(fill="x", pady=(0, 8))
+            ttk.Label(quantity_header, text="置顶数量款号", style="PanelTitle.TLabel").pack(side="left")
+            ttk.Button(quantity_header, text="保存配置", command=self.save_all_config, style="Accent.TButton").pack(side="right", padx=(6, 0))
+            ttk.Button(quantity_header, text="新增/修改", command=self.edit_quantity_only_style).pack(side="right", padx=(6, 0))
+            ttk.Button(quantity_header, text="删除", command=self.delete_quantity_only_style, style="Danger.TButton").pack(side="right")
+            ttk.Label(
+                quantity_panel,
+                text="这些最终款号会放在汇总表最前；置顶分组标题只显示数量，底部总款数仍会计入。",
+                style="Muted.TLabel",
+                wraplength=420,
+                justify="left",
+            ).pack(fill="x", pady=(0, 6))
+            self.quantity_only_tree = ttk.Treeview(quantity_panel, columns=("style",), show="headings")
+            self.quantity_only_tree.heading("style", text="最终款号")
+            self.quantity_only_tree.column("style", width=220, anchor="center")
+            self.quantity_only_tree.pack(side="left", fill="both", expand=True)
+            quantity_sb = ttk.Scrollbar(quantity_panel, orient="vertical", command=self.quantity_only_tree.yview)
+            self.quantity_only_tree.configure(yscrollcommand=quantity_sb.set)
+            quantity_sb.pack(side="right", fill="y")
+            self.quantity_only_tree.bind("<Double-1>", lambda e: self.edit_quantity_only_style())
+            self.quantity_only_tree.bind("<Delete>", lambda e: self.delete_quantity_only_style())
 
         def add_log(self, text: str):
             self.log.insert("end", text + "\n")
             self.log.see("end")
             self.update_idletasks()
+
+        def clear_log(self):
+            self.log.delete("1.0", "end")
+            self._set_status("日志已清空")
 
         def add_pdfs(self):
             paths = filedialog.askopenfilenames(title="选择PDF", filetypes=[("PDF文件", "*.pdf")])
@@ -1264,53 +1673,93 @@ if tk is not None:
                 self._add_pdf_paths(collect_pdf_paths([Path(folder)]))
 
         def _add_pdf_paths(self, paths: Iterable[Path]):
+            was_empty = not self.pdf_paths
             existing = {str(p.resolve()) for p in self.pdf_paths}
+            added = 0
             for p in paths:
                 if p.exists() and p.suffix.lower() == ".pdf" and str(p.resolve()) not in existing:
                     self.pdf_paths.append(p)
                     existing.add(str(p.resolve()))
+                    added += 1
             self.refresh_pdf_tree()
+            if added:
+                if was_empty:
+                    self.output_var.set(str(self._default_output_path()))
+                self._set_status(f"已添加 {added} 个 PDF")
+            else:
+                self._set_status("没有新增 PDF")
 
         def refresh_pdf_tree(self):
             for i in self.pdf_tree.get_children():
                 self.pdf_tree.delete(i)
-            for p in self.pdf_paths:
-                self.pdf_tree.insert("", "end", values=(str(p),))
+            for idx, p in enumerate(self.pdf_paths):
+                self.pdf_tree.insert("", "end", iid=f"pdf:{idx}", values=(p.name, str(p.parent), str(p)))
+            self.pdf_count_var.set(f"{len(self.pdf_paths)} 个 PDF")
+            state = "normal" if self.pdf_paths and not self.processing else "disabled"
+            if hasattr(self, "run_btn"):
+                self.run_btn.configure(state=state)
+            if hasattr(self, "remove_pdf_btn"):
+                self.remove_pdf_btn.configure(state="normal" if self.pdf_paths else "disabled")
+            if hasattr(self, "clear_pdf_btn"):
+                self.clear_pdf_btn.configure(state="normal" if self.pdf_paths else "disabled")
 
         def remove_selected_pdf(self):
             selected = self.pdf_tree.selection()
             if not selected:
+                self._set_status("请先选择要移除的 PDF")
                 return
-            selected_paths = {self.pdf_tree.item(i, "values")[0] for i in selected}
+            selected_paths = {self.pdf_tree.item(i, "values")[2] for i in selected}
             self.pdf_paths = [p for p in self.pdf_paths if str(p) not in selected_paths]
             self.refresh_pdf_tree()
+            self._set_status(f"已移除 {len(selected)} 个 PDF")
 
         def clear_pdfs(self):
             self.pdf_paths = []
             self.refresh_pdf_tree()
+            self._set_status("PDF 队列已清空")
 
         def choose_output(self):
             path = filedialog.asksaveasfilename(
                 title="保存输出Excel",
                 defaultextension=".xlsx",
                 filetypes=[("Excel文件", "*.xlsx")],
-                initialfile="报货汇总.xlsx",
+                initialdir=str((self.pdf_paths[0].parent if self.pdf_paths else Path.cwd()).resolve()),
+                initialfile=Path(self.output_var.get() or self._default_output_path()).name,
             )
             if path:
                 self.output_var.set(path)
+                self._set_status("已更新输出位置")
+
+        def open_output_folder(self):
+            path = self.last_output_path or Path(self.output_var.get().strip())
+            folder = path.parent if path.suffix else path
+            if not folder.exists():
+                messagebox.showwarning("提示", "输出目录不存在。")
+                return
+            try:
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            except Exception as e:
+                messagebox.showerror("打开失败", str(e))
 
         def run_process(self):
             if not self.pdf_paths:
                 messagebox.showwarning("提示", "请先添加至少一个 PDF。")
                 return
             out_path = Path(self.output_var.get().strip())
-            if not out_path:
+            if not str(out_path):
                 messagebox.showwarning("提示", "请设置输出 Excel 路径。")
                 return
+            if out_path.suffix.lower() != ".xlsx":
+                messagebox.showwarning("提示", "输出路径必须是 .xlsx 文件。")
+                return
             try:
+                self._set_busy(True)
+                self._set_status("正在处理 PDF...")
                 self.save_all_config(show_msg=False)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
                 self.add_log("开始处理...")
                 result = process_pdfs(self.pdf_paths, out_path, self.cfg)
+                self.last_output_path = out_path
                 self.add_log(f"完成：{result['out_path']}")
                 self.add_log(f"PDF数量：{result['pdf_count']}")
                 self.add_log(f"解析行数：{result['parsed_rows']}")
@@ -1318,29 +1767,63 @@ if tk is not None:
                 self.add_log(f"输出汇总款数：{result['output_lines']}款")
                 self.add_log(f"输出汇总数量：{result['output_qty']}")
                 self.add_log(f"异常数量：{result['issues']}")
+                self.result_summary_var.set(
+                    f"上次处理：{result['pdf_count']} 个 PDF，解析 {result['parsed_rows']} 行，原始 {result['original_qty']}，输出 {result['output_qty']}，异常 {result['issues']}"
+                )
+                self.config_state_var.set(f"配置：{self.cfg_path.name}")
+                self.open_output_btn.configure(state="normal")
+                self._set_status("处理完成")
                 messagebox.showinfo("完成", f"已生成：\n{result['out_path']}")
             except Exception as e:
                 self.add_log("处理失败：" + str(e))
                 self.add_log(traceback.format_exc())
+                self._set_status("处理失败")
                 messagebox.showerror("处理失败", str(e))
+            finally:
+                self._set_busy(False)
+                self.refresh_pdf_tree()
 
         def refresh_rules_tree(self):
+            selected_idx = self._selected_rule_actual_index() if self.rules_tree.selection() else None
             for i in self.rules_tree.get_children():
                 self.rules_tree.delete(i)
             for idx, rule in sorted_indexed_rules(self.cfg):
                 self.rules_tree.insert("", "end", iid=f"rule:{idx}", values=(
-                    "是" if rule.get("enabled", True) else "否",
+                    "启用" if rule.get("enabled", True) else "停用",
                     rule.get("priority", ""),
                     rule.get("name", ""),
-                    rule.get("group_name", ""),
-                    rule.get("match_type", ""),
-                    rule.get("pattern", ""),
-                    rule.get("output_styles", ""),
-                    rule.get("color_mode", ""),
-                    rule.get("fixed_colors", ""),
-                    rule.get("qty_multiplier", ""),
-                    rule.get("note", ""),
                 ))
+            if selected_idx is not None and f"rule:{selected_idx}" in self.rules_tree.get_children():
+                self.rules_tree.selection_set(f"rule:{selected_idx}")
+            elif self.rules_tree.get_children():
+                first = self.rules_tree.get_children()[0]
+                self.rules_tree.selection_set(first)
+            self.refresh_rule_detail()
+
+        def refresh_rule_detail(self):
+            idx = self._selected_rule_actual_index()
+            if idx is None:
+                self.rule_detail_title_var.set("请选择一条规则")
+                self.rule_detail_meta_var.set("")
+                for var in self.rule_detail_fields.values():
+                    var.set("")
+                return
+
+            rule = self.cfg.get("rules", [])[idx]
+            enabled = "启用" if rule.get("enabled", True) else "停用"
+            self.rule_detail_title_var.set(str(rule.get("name", "未命名规则")))
+            self.rule_detail_meta_var.set(
+                f"{enabled}  |  优先级 {rule.get('priority', '')}  |  命中后输出 {rule.get('output_styles', '{auto}') or '{auto}'}"
+            )
+            for key, var in self.rule_detail_fields.items():
+                value = rule.get(key, "")
+                if key == "fixed_colors" and not value:
+                    value = "无"
+                if key == "group_name" and not value:
+                    value = "按分组规则 / 未分组"
+                if key == "note" and not value:
+                    value = "无"
+                var.set(str(value))
 
         def _selected_rule_actual_index(self) -> Optional[int]:
             sel = self.rules_tree.selection()
@@ -1358,6 +1841,13 @@ if tk is not None:
             if dlg.result:
                 self.cfg.setdefault("rules", []).append(dlg.result)
                 self.refresh_rules_tree()
+                new_iid = f"rule:{len(self.cfg.get('rules', [])) - 1}"
+                if new_iid in self.rules_tree.get_children():
+                    self.rules_tree.selection_set(new_iid)
+                    self.rules_tree.see(new_iid)
+                    self.refresh_rule_detail()
+                self._mark_config_dirty()
+                self._set_status("已新增规则")
 
         def edit_rule(self):
             idx = self._selected_rule_actual_index()
@@ -1369,14 +1859,24 @@ if tk is not None:
             if dlg.result:
                 self.cfg["rules"][idx] = dlg.result
                 self.refresh_rules_tree()
+                iid = f"rule:{idx}"
+                if iid in self.rules_tree.get_children():
+                    self.rules_tree.selection_set(iid)
+                    self.rules_tree.see(iid)
+                    self.refresh_rule_detail()
+                self._mark_config_dirty()
+                self._set_status("已更新规则")
 
         def delete_rule(self):
             idx = self._selected_rule_actual_index()
             if idx is None:
+                self._set_status("请先选择要删除的规则")
                 return
             if messagebox.askyesno("确认", "确定删除选中的规则吗？"):
                 self.cfg["rules"].pop(idx)
                 self.refresh_rules_tree()
+                self._mark_config_dirty()
+                self._set_status("已删除规则")
 
         def refresh_group_rules_tree(self):
             for i in self.group_tree.get_children():
@@ -1407,6 +1907,8 @@ if tk is not None:
             if dlg.result:
                 self.cfg.setdefault("group_rules", []).append(dlg.result)
                 self.refresh_group_rules_tree()
+                self._mark_config_dirty()
+                self._set_status("已新增分组规则")
 
         def edit_group_rule(self):
             idx = self._selected_group_rule_actual_index()
@@ -1418,14 +1920,19 @@ if tk is not None:
             if dlg.result:
                 self.cfg["group_rules"][idx] = dlg.result
                 self.refresh_group_rules_tree()
+                self._mark_config_dirty()
+                self._set_status("已更新分组规则")
 
         def delete_group_rule(self):
             idx = self._selected_group_rule_actual_index()
             if idx is None:
+                self._set_status("请先选择要删除的分组规则")
                 return
             if messagebox.askyesno("确认", "确定删除选中的分组规则吗？"):
                 self.cfg["group_rules"].pop(idx)
                 self.refresh_group_rules_tree()
+                self._mark_config_dirty()
+                self._set_status("已删除分组规则")
 
         def refresh_color_table(self):
             for i in self.color_tree.get_children():
@@ -1458,6 +1965,8 @@ if tk is not None:
                     self.cfg["color_map"].pop(old_en, None)
                 self.cfg.setdefault("color_map", {})[en] = cn
                 self.refresh_color_table()
+                self._mark_config_dirty()
+                self._set_status("已更新颜色映射")
                 win.destroy()
             ttk.Button(win, text="保存", command=ok).grid(row=2, column=0, columnspan=2, pady=8)
             win.grab_set()
@@ -1465,10 +1974,13 @@ if tk is not None:
         def delete_color(self):
             sel = self.color_tree.selection()
             if not sel:
+                self._set_status("请先选择要删除的颜色")
                 return
             en = self.color_tree.item(sel[0], "values")[0]
             self.cfg.get("color_map", {}).pop(en, None)
             self.refresh_color_table()
+            self._mark_config_dirty()
+            self._set_status("已删除颜色映射")
 
         def refresh_prefix_table(self):
             for i in self.prefix_tree.get_children():
@@ -1513,6 +2025,8 @@ if tk is not None:
                 else:
                     lst[actual_idx] = item
                 self.refresh_prefix_table()
+                self._mark_config_dirty()
+                self._set_status("已更新款号前缀替换")
                 win.destroy()
             ttk.Button(win, text="保存", command=ok).grid(row=3, column=0, columnspan=2, pady=8)
             win.grab_set()
@@ -1520,15 +2034,140 @@ if tk is not None:
         def delete_prefix(self):
             sel = self.prefix_tree.selection()
             if not sel:
+                self._set_status("请先选择要删除的前缀替换")
                 return
             vals = self.prefix_tree.item(sel[0], "values")
             old_from, old_to = vals[1], vals[2]
             lst = self.cfg.get("general", {}).get("style_prefix_replace", [])
             self.cfg["general"]["style_prefix_replace"] = [x for x in lst if not (x.get("from") == old_from and x.get("to") == old_to)]
             self.refresh_prefix_table()
+            self._mark_config_dirty()
+            self._set_status("已删除款号前缀替换")
+
+        def refresh_style_code_table(self):
+            for i in self.style_code_tree.get_children():
+                self.style_code_tree.delete(i)
+            for item in self.cfg.get("general", {}).get("style_code_replace", []):
+                self.style_code_tree.insert("", "end", values=("是" if item.get("enabled", True) else "否", item.get("from", ""), item.get("to", "")))
+
+        def edit_style_code_replace(self):
+            sel = self.style_code_tree.selection()
+            actual_idx = None
+            enabled = True
+            old_from = old_to = ""
+            if sel:
+                vals = self.style_code_tree.item(sel[0], "values")
+                enabled = vals[0] == "是"
+                old_from, old_to = vals[1], vals[2]
+                for idx, item in enumerate(self.cfg.get("general", {}).get("style_code_replace", [])):
+                    if item.get("from", "") == old_from and item.get("to", "") == old_to:
+                        actual_idx = idx
+                        break
+            win = tk.Toplevel(self)
+            win.title("款号对照替换")
+            win.resizable(False, False)
+            enabled_var = tk.BooleanVar(value=enabled)
+            from_var = tk.StringVar(value=old_from)
+            to_var = tk.StringVar(value=old_to)
+            ttk.Checkbutton(win, text="启用", variable=enabled_var).grid(row=0, column=0, columnspan=2, padx=8, pady=6, sticky="w")
+            ttk.Label(win, text="原款号").grid(row=1, column=0, padx=8, pady=6, sticky="e")
+            ttk.Entry(win, textvariable=from_var, width=28).grid(row=1, column=1, padx=8, pady=6)
+            ttk.Label(win, text="替换为").grid(row=2, column=0, padx=8, pady=6, sticky="e")
+            ttk.Entry(win, textvariable=to_var, width=28).grid(row=2, column=1, padx=8, pady=6)
+
+            def ok():
+                src = from_var.get().strip()
+                dst = to_var.get().strip()
+                if not src or not dst:
+                    messagebox.showerror("错误", "原款号和替换款号不能为空。")
+                    return
+                item = {"enabled": bool(enabled_var.get()), "from": src, "to": dst}
+                lst = self.cfg.setdefault("general", {}).setdefault("style_code_replace", [])
+                if actual_idx is None:
+                    lst.append(item)
+                else:
+                    lst[actual_idx] = item
+                self.refresh_style_code_table()
+                self._mark_config_dirty()
+                self._set_status("已更新款号对照替换")
+                win.destroy()
+
+            ttk.Button(win, text="保存", command=ok).grid(row=3, column=0, columnspan=2, pady=8)
+            win.grab_set()
+
+        def delete_style_code_replace(self):
+            sel = self.style_code_tree.selection()
+            if not sel:
+                self._set_status("请先选择要删除的款号对照")
+                return
+            vals = self.style_code_tree.item(sel[0], "values")
+            old_from, old_to = vals[1], vals[2]
+            lst = self.cfg.get("general", {}).get("style_code_replace", [])
+            self.cfg["general"]["style_code_replace"] = [x for x in lst if not (x.get("from") == old_from and x.get("to") == old_to)]
+            self.refresh_style_code_table()
+            self._mark_config_dirty()
+            self._set_status("已删除款号对照替换")
+
+        def refresh_quantity_only_table(self):
+            for i in self.quantity_only_tree.get_children():
+                self.quantity_only_tree.delete(i)
+            styles = self.cfg.get("general", {}).get("quantity_only_styles", [])
+            if isinstance(styles, str):
+                styles = normalize_separator_list(styles)
+            for style in styles:
+                self.quantity_only_tree.insert("", "end", values=(style,))
+
+        def edit_quantity_only_style(self):
+            sel = self.quantity_only_tree.selection()
+            old_style = ""
+            if sel:
+                old_style = self.quantity_only_tree.item(sel[0], "values")[0]
+            win = tk.Toplevel(self)
+            win.title("置顶数量款号")
+            win.resizable(False, False)
+            style_var = tk.StringVar(value=old_style)
+            ttk.Label(win, text="最终款号").grid(row=0, column=0, padx=8, pady=6, sticky="e")
+            ttk.Entry(win, textvariable=style_var, width=28).grid(row=0, column=1, padx=8, pady=6)
+
+            def ok():
+                style = style_var.get().strip()
+                if not style:
+                    messagebox.showerror("错误", "款号不能为空。")
+                    return
+                styles = self.cfg.setdefault("general", {}).setdefault("quantity_only_styles", [])
+                if isinstance(styles, str):
+                    styles = normalize_separator_list(styles)
+                    self.cfg["general"]["quantity_only_styles"] = styles
+                if old_style and old_style in styles:
+                    styles[styles.index(old_style)] = style
+                elif style not in styles:
+                    styles.append(style)
+                self.refresh_quantity_only_table()
+                self._mark_config_dirty()
+                self._set_status("已更新置顶数量款号")
+                win.destroy()
+
+            ttk.Button(win, text="保存", command=ok).grid(row=1, column=0, columnspan=2, pady=8)
+            win.grab_set()
+
+        def delete_quantity_only_style(self):
+            sel = self.quantity_only_tree.selection()
+            if not sel:
+                self._set_status("请先选择要删除的置顶数量款号")
+                return
+            style = self.quantity_only_tree.item(sel[0], "values")[0]
+            styles = self.cfg.get("general", {}).get("quantity_only_styles", [])
+            if isinstance(styles, str):
+                styles = normalize_separator_list(styles)
+            self.cfg["general"]["quantity_only_styles"] = [x for x in styles if x != style]
+            self.refresh_quantity_only_table()
+            self._mark_config_dirty()
+            self._set_status("已删除置顶数量款号")
 
         def save_all_config(self, show_msg: bool = True):
             save_config(self.cfg, self.cfg_path)
+            self.config_state_var.set(f"配置：{self.cfg_path.name}")
+            self._set_status("配置已保存")
             if show_msg:
                 messagebox.showinfo("已保存", f"配置已保存到：\n{self.cfg_path}")
 
@@ -1540,12 +2179,17 @@ if tk is not None:
                 self.refresh_group_rules_tree()
                 self.refresh_color_table()
                 self.refresh_prefix_table()
-                messagebox.showinfo("完成", "配置已导入。记得点击保存规则。")
+                self.refresh_style_code_table()
+                self.refresh_quantity_only_table()
+                self._mark_config_dirty()
+                self._set_status("配置已导入，尚未保存到默认配置文件")
+                messagebox.showinfo("完成", "配置已导入。点击“保存配置”后会写入当前默认配置文件。")
 
         def export_config(self):
             path = filedialog.asksaveasfilename(title="导出配置", defaultextension=".json", filetypes=[("JSON配置", "*.json")])
             if path:
                 save_config(self.cfg, Path(path))
+                self._set_status("配置已导出")
                 messagebox.showinfo("完成", f"配置已导出：\n{path}")
 
         def reset_config(self):
@@ -1555,6 +2199,11 @@ if tk is not None:
                 self.refresh_group_rules_tree()
                 self.refresh_color_table()
                 self.refresh_prefix_table()
+                self.refresh_style_code_table()
+                self.refresh_quantity_only_table()
+                self.output_var.set(str(self._default_output_path()))
+                self._mark_config_dirty()
+                self._set_status("已恢复默认配置，尚未保存")
 
 
 def run_cli(args: argparse.Namespace) -> None:
@@ -1598,6 +2247,7 @@ def main():
 
     if tk is None:
         raise SystemExit("当前 Python 环境没有 tkinter，无法启动 GUI。可以使用 --cli 命令行模式。")
+    enable_dpi_awareness()
     app = BaohuoApp()
     app.mainloop()
 
