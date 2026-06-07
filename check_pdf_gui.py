@@ -57,8 +57,10 @@ except Exception:  # pragma: no cover
     filedialog = None
     messagebox = None
 
-APP_NAME = "报货PDF汇总工具"
+APP_NAME = "PDF_Checker"
 CONFIG_FILE_NAME = "check_rules.json"
+APPDATA_DIR_NAME = "PDF_Checker"
+LEGACY_APPDATA_DIR_NAMES = ["BaohuoPDFSummaryTool"]
 
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 # 可识别：SK-010、PG-JS-836、MGTZ-26、MG-55、SSL-14、XZ-21+XZ-20、MG-55+SSL-14
@@ -244,7 +246,35 @@ def app_dir() -> Path:
 
 
 def default_config_path() -> Path:
+    return user_config_dir() / CONFIG_FILE_NAME
+
+
+def bundled_config_path() -> Path:
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundled = Path(bundle_dir) / CONFIG_FILE_NAME
+        if bundled.exists():
+            return bundled
     return app_dir() / CONFIG_FILE_NAME
+
+
+def user_config_dir() -> Path:
+    if sys.platform == "win32":
+        root = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root) / APPDATA_DIR_NAME
+    return Path.home() / f".{APPDATA_DIR_NAME}"
+
+
+def legacy_config_paths() -> List[Path]:
+    paths: List[Path] = []
+    if sys.platform == "win32":
+        root = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if root:
+            paths.extend(Path(root) / name / CONFIG_FILE_NAME for name in LEGACY_APPDATA_DIR_NAMES)
+    else:
+        paths.extend(Path.home() / f".{name}" / CONFIG_FILE_NAME for name in LEGACY_APPDATA_DIR_NAMES)
+    return paths
 
 
 def deep_copy_default_config() -> Dict[str, Any]:
@@ -254,7 +284,15 @@ def deep_copy_default_config() -> Dict[str, Any]:
 def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     path = path or default_config_path()
     if not path.exists():
-        cfg = deep_copy_default_config()
+        source_path = next((p for p in legacy_config_paths() if p.exists()), None)
+        template_path = bundled_config_path()
+        if source_path is None and path != template_path and template_path.exists():
+            source_path = template_path
+        if source_path is not None:
+            with open(source_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        else:
+            cfg = deep_copy_default_config()
         save_config(cfg, path)
         return cfg
     with open(path, "r", encoding="utf-8") as f:
@@ -271,6 +309,7 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
 
 def save_config(cfg: Dict[str, Any], path: Optional[Path] = None) -> None:
     path = path or default_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
@@ -678,8 +717,26 @@ def group_sort_key(group: str, group_first_index: Dict[str, int], cfg: Optional[
     return (group_first_index.get(group, 999999), group)
 
 
-def style_sort_key(group: str, style: str, first_index: Dict[Tuple[str, str], int]) -> Tuple[int, str]:
-    return (first_index.get((group, style), 999999), style)
+def style_number_parts(style: str) -> Optional[Tuple[str, int, str]]:
+    m = re.fullmatch(r"([A-Z]+(?:-[A-Z]+)*)-(\d+)", (style or "").strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), m.group(2)
+
+
+def group_prefix(group: str) -> str:
+    m = re.match(r"[A-Z]+(?:-[A-Z]+)*", (group or "").strip().upper())
+    return m.group(0) if m else ""
+
+
+def style_sort_key(group: str, style: str, first_index: Dict[Tuple[str, str], int]) -> Tuple[int, str, int, int, str]:
+    first_seen = first_index.get((group, style), 999999)
+    parts = style_number_parts(style)
+    target_prefix = group_prefix(group)
+    if parts and target_prefix and parts[0] == target_prefix:
+        prefix, number, raw_number = parts
+        return (0, prefix, number, len(raw_number), style)
+    return (1, "", first_seen, 0, style)
 
 
 def _fmt_qty(qty: float) -> Any:
@@ -1145,6 +1202,7 @@ if tk is not None:
                 "说明：分组规则按‘输出款号’匹配，不按 PDF 原始 SKU 匹配。\n"
                 "例：匹配方式 startswith，匹配款号 MG-，分组名称 MG系列，所有 MG- 开头的款会排在一起。\n"
                 "多个匹配款号可用逗号分隔，例如 CW-,YYCK- 会归到同一个分组。\n"
+                "特殊指定用 exact，例如 SK-010,SK-011 分组名称 MG，会把这些款直接归到 MG。\n"
                 "如果同一个款号命中多个分组规则，优先级数字越小越先使用。"
             )
             ttk.Label(frm, text=help_text, justify="left", foreground="#555").grid(row=row, column=0, columnspan=2, sticky="w", **pad)
@@ -1523,6 +1581,7 @@ if tk is not None:
             btnfrm.pack(fill="x", pady=(0, 10))
             ttk.Label(btnfrm, text="分组设置", style="PanelTitle.TLabel").pack(side="left", padx=(0, 12))
             ttk.Button(btnfrm, text="新增", command=self.add_group_rule).pack(side="left", padx=(0, 6))
+            ttk.Button(btnfrm, text="新增特殊规则", command=self.add_special_group_rule).pack(side="left", padx=(0, 6))
             ttk.Button(btnfrm, text="编辑", command=self.edit_group_rule).pack(side="left", padx=(0, 6))
             ttk.Button(btnfrm, text="删除", command=self.delete_group_rule, style="Danger.TButton").pack(side="left", padx=(0, 6))
             ttk.Button(btnfrm, text="保存配置", command=self.save_all_config, style="Accent.TButton").pack(side="right")
@@ -1531,7 +1590,7 @@ if tk is not None:
             tip_panel.pack(fill="x", pady=(0, 10))
             ttk.Label(
                 tip_panel,
-                text="分组规则按最终输出款号匹配。匹配款号可写多个，用逗号分隔，例如 CW-,YYCK-；优先级数字越小越先使用。",
+                text="分组规则按最终输出款号匹配。特殊规则用于把指定款号直接归到某个分组，例如 SK-010 -> MG；多个款号可用逗号分隔。",
                 style="Muted.TLabel",
                 wraplength=1050,
                 justify="left",
@@ -1909,6 +1968,22 @@ if tk is not None:
                 self.refresh_group_rules_tree()
                 self._mark_config_dirty()
                 self._set_status("已新增分组规则")
+
+        def add_special_group_rule(self):
+            dlg = GroupRuleDialog(self, {
+                "enabled": True,
+                "priority": 10,
+                "name": "特殊分组规则",
+                "match_type": "exact",
+                "pattern": "",
+                "group_name": "",
+            })
+            self.wait_window(dlg)
+            if dlg.result:
+                self.cfg.setdefault("group_rules", []).append(dlg.result)
+                self.refresh_group_rules_tree()
+                self._mark_config_dirty()
+                self._set_status("已新增特殊分组规则")
 
         def edit_group_rule(self):
             idx = self._selected_group_rule_actual_index()
