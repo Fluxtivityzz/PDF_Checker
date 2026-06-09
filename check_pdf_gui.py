@@ -29,7 +29,7 @@ import os
 import re
 import sys
 import traceback
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -64,13 +64,26 @@ LEGACY_APPDATA_DIR_NAMES = ["BaohuoPDFSummaryTool"]
 
 HAN_RE = re.compile(r"[\u4e00-\u9fff]")
 # 可识别：SK-010、PG-JS-836、MGTZ-26、MG-55、SSL-14、XZ-21+XZ-20、MG-55+SSL-14
-STYLE_CODE_RE = re.compile(r"^([A-Z]+(?:-[A-Z]+)*-\d+(?:\+[A-Z]+(?:-[A-Z]+)*-\d+)*)")
+STYLE_CODE_RE = re.compile(r"^([A-Z]+(?:-[A-Z]+)*-\d+(?:\+[A-Z]+(?:-[A-Z]+)*-\d+)*)", re.I)
+NUMERIC_STYLE_CODE_RE = re.compile(r"^(\d+)(?:-[A-Z][A-Z0-9]*(?:\+[A-Z][A-Z0-9]*)*)?$", re.I)
 SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL", "XXXL", "XXXXL"]
 COLOR_ORDER = [
     "白色", "黑色", "灰色", "浅灰色", "深灰色",
     "浅蓝色", "天蓝色", "藏青色", "军绿色", "军绿", "卡其色", "杏色", "粉红色", "土黄色",
     "白色+卡其色", "白色+黑色", "黑色+藏青色", "军绿+卡其色", "军绿色+卡其色",
 ]
+
+COLOR_ALIASES = {
+    "浅灰": "浅灰色",
+    "深灰": "深灰色",
+    "浅蓝": "浅蓝色",
+    "天蓝": "天蓝色",
+    "藏青": "藏青色",
+    "军绿": "军绿色",
+    "卡其": "卡其色",
+    "粉红": "粉红色",
+    "土黄": "土黄色",
+}
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "version": 3,
@@ -105,6 +118,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ArmyBlue": "军绿色",
         "Khaki": "卡其色",
         "Apricot": "杏色",
+        "Red": "红色",
         "PinkRed": "粉红色",
         "EarthyYellow": "土黄色",
     },
@@ -229,6 +243,7 @@ class OutputRow:
     output_attr: str
     qty: float
     rule_name: str
+    dedupe_existing_attrs: bool = False
 
 
 @dataclass
@@ -423,6 +438,8 @@ def parse_pdf_rows(pdf_path: Path) -> Tuple[List[ParsedRow], List[ParseIssue], s
 
 def normalize_style(style: str, cfg: Dict[str, Any]) -> str:
     style = (style or "").strip()
+    if re.fullmatch(r"[A-Z]+(?:-[A-Z]+)*-\d+(?:\+[A-Z]+(?:-[A-Z]+)*-\d+)*", style, flags=re.I):
+        style = style.upper()
     for item in cfg.get("general", {}).get("style_prefix_replace", []):
         if not item.get("enabled", True):
             continue
@@ -462,11 +479,34 @@ def is_quantity_only_style(style: str, cfg: Dict[str, Any]) -> bool:
     return normalize_style(style, cfg) in quantity_only_style_set(cfg)
 
 
+def is_attrless_quantity_style(style: str, cfg: Dict[str, Any]) -> bool:
+    normalized = normalize_style(style, cfg)
+    return re.fullmatch(r"\d+", normalized) is not None and normalized in quantity_only_style_set(cfg)
+
+
+def should_dedupe_existing_attrs(rule: Dict[str, Any]) -> bool:
+    if rule.get("dedupe_existing_attrs", False):
+        return True
+    pattern = str(rule.get("pattern", "")).upper()
+    output_styles = str(rule.get("output_styles", "")).upper()
+    return rule.get("color_mode") == "sku_color" and ("MG-8" in pattern or "MG-8" in output_styles)
+
+
+def should_split_mg8_combo(row: ParsedRow, styles: List[str], cfg: Dict[str, Any]) -> bool:
+    if not any(normalize_style(style, cfg) == "MG-8" for style in styles):
+        return False
+    color, _ = split_attr(row.attr)
+    return "+" in color
+
+
 def get_auto_style_codes(sku_code: str, cfg: Dict[str, Any]) -> List[str]:
     code = (sku_code or "").strip().replace(" ", "-")
     code = re.sub(r"-+", "-", code)
     m = STYLE_CODE_RE.match(code)
     if not m:
+        numeric_m = NUMERIC_STYLE_CODE_RE.match(code)
+        if numeric_m:
+            return [normalize_style(numeric_m.group(1), cfg)]
         return [normalize_style(code, cfg)] if code else ["未识别款号"]
     base = m.group(1)
     split_combo = cfg.get("general", {}).get("split_auto_combo_styles", True)
@@ -481,6 +521,23 @@ def split_attr(attr: str) -> Tuple[str, str]:
         return attr, ""
     color, size = attr.rsplit("-", 1)
     return color, size
+
+
+def normalize_color_name(color: str) -> str:
+    color = (color or "").strip()
+    if not color:
+        return color
+    parts = [part.strip() for part in re.split(r"\+", color)]
+    normalized = [COLOR_ALIASES.get(part, part) for part in parts if part]
+    return "+".join(normalized) if normalized else color
+
+
+def normalize_output_attr(attr: str) -> str:
+    color, size = split_attr(attr)
+    color = normalize_color_name(color)
+    if size:
+        return f"{color}-{size}" if color else size
+    return color
 
 
 def normalize_separator_list(s: str) -> List[str]:
@@ -527,6 +584,12 @@ def english_color_tokens_from_sku(sku_code: str) -> List[str]:
 
 
 def map_color_token(token: str, cfg: Dict[str, Any]) -> str:
+    built_in = {
+        "red": "红色",
+    }
+    built_in_color = built_in.get((token or "").strip().lower())
+    if built_in_color:
+        return built_in_color
     cmap = cfg.get("color_map", {})
     if token in cmap:
         return cmap[token]
@@ -651,15 +714,22 @@ def apply_rules_to_row(row: ParsedRow, cfg: Dict[str, Any]) -> List[OutputRow]:
         }
 
     styles = parse_output_styles(str(matched_rule.get("output_styles", "{auto}")), row.sku_code, cfg)
-    attrs = output_attrs_by_color_mode(matched_rule, row, cfg)
+    force_split_mg8_combo = should_split_mg8_combo(row, styles, cfg)
+    attr_rule = matched_rule
+    if force_split_mg8_combo:
+        attr_rule = dict(matched_rule)
+        attr_rule["color_mode"] = "split_attr_color"
+    attrs = [normalize_output_attr(attr) for attr in output_attrs_by_color_mode(attr_rule, row, cfg)]
     try:
         multiplier = float(matched_rule.get("qty_multiplier", 1) or 1)
     except Exception:
         multiplier = 1
+    dedupe_existing_attrs = force_split_mg8_combo or should_dedupe_existing_attrs(matched_rule)
 
     out_rows: List[OutputRow] = []
     for style in styles:
-        for attr in attrs:
+        style_attrs = [""] if is_attrless_quantity_style(style, cfg) else attrs
+        for attr in style_attrs:
             qty = row.qty * multiplier
             # 一般报货数量应为整数；若用户设置了小数倍数，保留整数四舍五入并在明细中体现。
             if abs(qty - round(qty)) < 1e-9:
@@ -677,6 +747,7 @@ def apply_rules_to_row(row: ParsedRow, cfg: Dict[str, Any]) -> List[OutputRow]:
                 output_attr=attr,
                 qty=qty_value,
                 rule_name=str(matched_rule.get("name", "未命名规则")),
+                dedupe_existing_attrs=dedupe_existing_attrs,
             ))
     return out_rows
 
@@ -709,6 +780,18 @@ def aggregate_output_rows(out_rows: List[OutputRow]) -> Tuple[OrderedDict, Dict[
             style_first_index[(group, r.output_style)] = idx
         groups[group][r.output_style][r.output_attr] = groups[group][r.output_style].get(r.output_attr, 0) + r.qty
     return groups, style_first_index, group_first_index
+
+
+def dedupe_split_attrs_against_existing(out_rows: List[OutputRow]) -> List[OutputRow]:
+    existing_attrs = {
+        (r.group_name, r.output_style, r.output_attr)
+        for r in out_rows
+        if not r.dedupe_existing_attrs
+    }
+    return [
+        r for r in out_rows
+        if not (r.dedupe_existing_attrs and (r.group_name, r.output_style, r.output_attr) in existing_attrs)
+    ]
 
 
 def group_sort_key(group: str, group_first_index: Dict[str, int], cfg: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
@@ -992,6 +1075,7 @@ def process_pdfs(pdf_paths: List[Path], out_path: Path, cfg: Dict[str, Any]) -> 
     detail_rows: List[OutputRow] = []
     for row in all_parsed:
         detail_rows.extend(apply_rules_to_row(row, cfg))
+    detail_rows = dedupe_split_attrs_against_existing(detail_rows)
 
     groups, first_index, group_first_index = aggregate_output_rows(detail_rows)
     title = titles[0] if titles else "报货汇总"

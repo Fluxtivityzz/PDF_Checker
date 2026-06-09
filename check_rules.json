@@ -22,7 +22,8 @@
       }
     ],
     "quantity_only_styles": [
-      "SK-015"
+      "SK-015",
+      "26318"
     ]
   },
   "color_map": {
@@ -30,19 +31,20 @@
     "Black": "黑色",
     "Grey": "灰色",
     "Gray": "灰色",
-    "LightGrey": "浅灰",
-    "LightGray": "浅灰",
-    "DarkGrey": "深灰",
-    "DarkGray": "深灰",
-    "LightBlue": "浅蓝",
-    "SkyBlue": "天蓝",
-    "NavyBlue": "藏青",
-    "DarkBlue": "藏青",
-    "ArmyGreen": "军绿",
-    "Khaki": "卡其",
+    "LightGrey": "浅灰色",
+    "LightGray": "浅灰色",
+    "DarkGrey": "深灰色",
+    "DarkGray": "深灰色",
+    "LightBlue": "浅蓝色",
+    "SkyBlue": "天蓝色",
+    "NavyBlue": "藏青色",
+    "DarkBlue": "藏青色",
+    "ArmyGreen": "军绿色",
+    "Khaki": "卡其色",
     "Apricot": "杏色",
-    "PinkRed": "粉红",
-    "EarthyYellow": "土黄"
+    "Red": "红色",
+    "PinkRed": "粉红色",
+    "EarthyYellow": "土黄色"
   },
   "rules": [
     {
