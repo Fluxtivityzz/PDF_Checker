@@ -624,6 +624,10 @@ def output_attrs_by_color_mode(rule: Dict[str, Any], row: ParsedRow, cfg: Dict[s
         colors = [map_color_token(t, cfg) for t in tokens]
         if not colors:
             return [row.attr]
+        if any(re.search(r"[A-Za-z]", color) for color in colors):
+            colors = [c.strip() for c in re.split(r"\+", color) if c.strip()]
+            if not colors:
+                return [row.attr]
         return [f"{c}-{size}" if size else c for c in colors]
 
     return [row.attr]
@@ -828,6 +832,10 @@ def _fmt_qty(qty: float) -> Any:
     return qty
 
 
+def excel_text(value: str) -> str:
+    return str(value).replace('"', '""')
+
+
 def write_excel(
     groups: OrderedDict,
     first_index: Dict[Tuple[str, str], int],
@@ -840,6 +848,11 @@ def write_excel(
     cfg: Dict[str, Any],
 ) -> None:
     wb = Workbook()
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except AttributeError:
+        pass
     thin = Side(style="thin", color="D9D9D9")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     group_fill = PatternFill("solid", fgColor="D9EAF7")
@@ -855,17 +868,10 @@ def write_excel(
     for col, width in zip(["A", "B", "C", "D"], [16, 22, 10, 10]):
         ws.column_dimensions[col].width = width
 
-    unique_styles = set()
-    total_qty = 0
-    for group, styles in groups.items():
-        for style, attrs in styles.items():
-            unique_styles.add(style)
-            total_qty += sum(attrs.values())
-
     ws["A2"] = "不同款号"
-    ws["B2"] = f"{len(unique_styles)}款"
+    ws["B2"] = ""
     ws["C2"] = "总数量"
-    ws["D2"] = _fmt_qty(total_qty)
+    ws["D2"] = ""
     for col in range(1, 5):
         cell = ws.cell(row=2, column=col)
         cell.font = Font(name="微软雅黑", size=10, bold=True)
@@ -876,19 +882,16 @@ def write_excel(
     row_idx = 4
     show_group_headers = bool(cfg.get("general", {}).get("show_group_headers", True))
     blank_between = bool(cfg.get("general", {}).get("blank_row_between_styles", True))
+    group_header_rows: List[Tuple[int, str, bool]] = []
 
     for group in sorted(groups.keys(), key=lambda g: group_sort_key(g, group_first_index, cfg)):
         styles = groups[group]
-        group_styles = {style for style in styles.keys() if not is_quantity_only_style(style, cfg)}
-        group_qty = sum(sum(attrs.values()) for attrs in styles.values())
-
         if show_group_headers:
             ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=4)
             cell = ws.cell(row=row_idx, column=1)
-            if group == quantity_only_group_name(cfg):
-                cell.value = f"{group}    数量：{_fmt_qty(group_qty)}"
-            else:
-                cell.value = f"{group}    款数：{len(group_styles)}款    数量：{_fmt_qty(group_qty)}"
+            is_quantity_group = group == quantity_only_group_name(cfg)
+            cell.value = group
+            group_header_rows.append((row_idx, group, is_quantity_group))
             cell.font = Font(name="微软雅黑", size=11, bold=True)
             cell.alignment = Alignment(horizontal="left", vertical="center")
             cell.fill = group_fill
@@ -901,14 +904,25 @@ def write_excel(
         for style in sorted(styles.keys(), key=lambda st: style_sort_key(group, st, first_index)):
             attrs = styles[style]
             items = sorted(attrs.items(), key=lambda kv: attr_sort_key(kv[0]))
-            style_total = sum(q for _, q in items)
+            style_start_row = row_idx
             for n, (attr, qty) in enumerate(items):
                 if n == 0:
                     ws.cell(row=row_idx, column=1, value=style)
                 ws.cell(row=row_idx, column=2, value=attr)
                 ws.cell(row=row_idx, column=3, value=_fmt_qty(qty))
                 if n == len(items) - 1:
-                    ws.cell(row=row_idx, column=4, value=_fmt_qty(style_total))
+                    ws.cell(
+                        row=row_idx,
+                        column=4,
+                        value=(
+                            f"=SUM(C{style_start_row}:INDEX(C:C,"
+                            f'MATCH(TRUE,INDEX(A{style_start_row + 1}:A$1048576<>"",0),0)'
+                            f"+{style_start_row}-1))"
+                        ),
+                    )
+                ws.cell(row=row_idx, column=5, value=1 if n == 0 else "")
+                ws.cell(row=row_idx, column=6, value=group)
+                ws.cell(row=row_idx, column=7, value=1 if n == 0 and not is_quantity_only_style(style, cfg) else "")
                 for col in range(1, 5):
                     cell = ws.cell(row=row_idx, column=col)
                     cell.font = Font(name="微软雅黑", size=10, bold=(col == 1 and n == 0))
@@ -918,9 +932,45 @@ def write_excel(
             if blank_between:
                 row_idx += 1
 
+    last_data_row = row_idx - 1
+    if last_data_row < 4:
+        last_data_row = 4
+    data_end_formula = 'MATCH("合计",A:A,0)-1'
+    ws["B2"] = (
+        f'=COUNTIFS(A4:INDEX(A:A,{data_end_formula}),"<>",'
+        f'C4:INDEX(C:C,{data_end_formula}),"<>")&"款"'
+    )
+    ws["D2"] = f"=SUM(C4:INDEX(C:C,{data_end_formula}))"
+    for idx, (header_row, group, is_quantity_group) in enumerate(group_header_rows):
+        group_name = excel_text(group)
+        group_start_row = header_row + 1
+        if idx + 1 < len(group_header_rows):
+            group_end_row = group_header_rows[idx + 1][0] - 1
+        else:
+            group_end_row = last_data_row
+        if group_end_row < group_start_row:
+            group_end_row = group_start_row
+        if is_quantity_group:
+            ws.cell(row=header_row, column=1).value = (
+                f'="{group_name}    数量："&SUM(C{group_start_row}:C{group_end_row})'
+            )
+        else:
+            ws.cell(row=header_row, column=1).value = (
+                f'="{group_name}    款数："&'
+                f'COUNTIFS(A{group_start_row}:A{group_end_row},"<>",C{group_start_row}:C{group_end_row},"<>")'
+                f'&"款    数量："&SUM(C{group_start_row}:C{group_end_row})'
+            )
+
     ws.cell(row=row_idx, column=1, value="合计")
-    ws.cell(row=row_idx, column=2, value=f"{len(unique_styles)}款")
-    ws.cell(row=row_idx, column=3, value=_fmt_qty(total_qty))
+    ws.cell(
+        row=row_idx,
+        column=2,
+        value=(
+            f'=COUNTIFS(A4:INDEX(A:A,{data_end_formula}),"<>",'
+            f'C4:INDEX(C:C,{data_end_formula}),"<>")&"款"'
+        ),
+    )
+    ws.cell(row=row_idx, column=3, value=f"=SUM(C4:INDEX(C:C,{data_end_formula}))")
     for col in range(1, 5):
         cell = ws.cell(row=row_idx, column=col)
         cell.font = Font(name="微软雅黑", size=10, bold=True)
@@ -928,6 +978,8 @@ def write_excel(
         cell.fill = total_fill
         cell.border = border
     ws.freeze_panes = "A4"
+    for col in ["E", "F", "G"]:
+        ws.column_dimensions[col].hidden = True
 
     ds = wb.create_sheet("明细")
     headers = ["来源PDF", "页码", "原始SKU货号", "SKU ID", "原始属性集", "分组", "输出款号", "输出属性集", "数量", "命中规则"]
