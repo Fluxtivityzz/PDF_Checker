@@ -904,25 +904,18 @@ def write_excel(
         for style in sorted(styles.keys(), key=lambda st: style_sort_key(group, st, first_index)):
             attrs = styles[style]
             items = sorted(attrs.items(), key=lambda kv: attr_sort_key(kv[0]))
-            style_start_row = row_idx
             for n, (attr, qty) in enumerate(items):
                 if n == 0:
                     ws.cell(row=row_idx, column=1, value=style)
                 ws.cell(row=row_idx, column=2, value=attr)
                 ws.cell(row=row_idx, column=3, value=_fmt_qty(qty))
                 if n == len(items) - 1:
-                    ws.cell(
-                        row=row_idx,
-                        column=4,
-                        value=(
-                            f"=SUM(C{style_start_row}:INDEX(C:C,"
-                            f'MATCH(TRUE,INDEX(A{style_start_row + 1}:A$1048576<>"",0),0)'
-                            f"+{style_start_row}-1))"
-                        ),
-                    )
+                    ws.cell(row=row_idx, column=4, value=f"=SUMIFS(C:C,H:H,H{row_idx},I:I,I{row_idx})")
                 ws.cell(row=row_idx, column=5, value=1 if n == 0 else "")
                 ws.cell(row=row_idx, column=6, value=group)
                 ws.cell(row=row_idx, column=7, value=1 if n == 0 and not is_quantity_only_style(style, cfg) else "")
+                ws.cell(row=row_idx, column=8, value=f'=IF(A{row_idx}<>"",A{row_idx},H{row_idx - 1})')
+                ws.cell(row=row_idx, column=9, value=group)
                 for col in range(1, 5):
                     cell = ws.cell(row=row_idx, column=col)
                     cell.font = Font(name="微软雅黑", size=10, bold=(col == 1 and n == 0))
@@ -930,6 +923,9 @@ def write_excel(
                     cell.border = border
                 row_idx += 1
             if blank_between:
+                ws.cell(row=row_idx, column=4, value=f'=IF(AND(A{row_idx}<>"",C{row_idx}<>""),SUMIFS(C:C,H:H,H{row_idx},I:I,I{row_idx}),"")')
+                ws.cell(row=row_idx, column=8, value=f'=IF(A{row_idx}<>"",A{row_idx},H{row_idx - 1})')
+                ws.cell(row=row_idx, column=9, value=group)
                 row_idx += 1
 
     last_data_row = row_idx - 1
@@ -978,7 +974,7 @@ def write_excel(
         cell.fill = total_fill
         cell.border = border
     ws.freeze_panes = "A4"
-    for col in ["E", "F", "G"]:
+    for col in ["E", "F", "G", "H", "I"]:
         ws.column_dimensions[col].hidden = True
 
     ds = wb.create_sheet("明细")
